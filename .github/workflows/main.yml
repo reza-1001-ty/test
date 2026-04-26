@@ -18,4 +18,4 @@ jobs:
       - name: Run script (prints go to log)
         env:
           VIDEO_URL: "https://youtu.be/ZLaA58ANTck"   # 👈 همینی که می‌خواستی: یه متغیر ساده
-        run: python find_channel.py
+        run: python yt.py
