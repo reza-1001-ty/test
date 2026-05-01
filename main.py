@@ -109,7 +109,7 @@ async def other_messages(client: Client, message: Message):
 
 # راه‌اندازی worker هنگام شروع ربات
 @app.on_start()
-async def start_worker():
+async def start_worker(client):
     asyncio.create_task(process_file_worker())
     print("🔄 کارگر صف آماده به کار است.")
 
