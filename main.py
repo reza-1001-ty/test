@@ -9,57 +9,24 @@ API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# for test
-# proxy = {
-#     "scheme": "http",
-#     "hostname": "192.168.49.1",
-#     "port": "8282"
-# }
-
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 DOWNLOAD_PATH = "./downloads/"
 
-# صف برای پردازش متوالی فایل‌ها
-file_queue = asyncio.Queue()
+# صف برای مدیریت پردازش فایل‌ها
+job_queue = asyncio.Queue()
 
 
-async def process_file_worker():
-    """کارگری که فایل‌ها را یکی‌یکی از صف برمی‌دارد و پردازش می‌کند."""
+async def worker():
+    """وظیفه‌ی پس‌زمینه که فایل‌ها را به ترتیب از صف برداشته و پردازش می‌کند."""
     while True:
-        # دریافت یک آیتم از صف (اگر صف خالی باشد منتظر می‌ماند)
-        message, status_msg = await file_queue.get()
+        job = await job_queue.get()
         try:
-            # به‌روزرسانی پیام وضعیت: دریافت فایل
-            await status_msg.edit_text("⏳ در حال دریافت فایل... لطفاً صبر کنید.")
-
-            print(f"[DOWNLOAD] شروع دانلود فایل...")
-            file_path = await message.download(file_name=DOWNLOAD_PATH)
-
-            if file_path:
-                print(f"[DOWNLOAD] فایل با موفقیت در {file_path} ذخیره شد.")
-
-                await status_msg.edit_text("✅ فایل دانلود شد. در حال ارسال...")
-
-                parts_list = split_file(file_path)
-                # ارسال هر بخش با استفاده از تابع همگام rubika.send_file در یک thread جدا
-                for part in parts_list:
-                    # اگر rubika.send_file همگام (sync) است، با asyncio.to_thread اجرا می‌کنیم
-                    await asyncio.to_thread(rubika.send_file, part, "File")
-
-                await status_msg.edit_text("✅ فایل با موفقیت آپلود شد.")
-                # در صورت تمایل می‌توانید پیام دیگری هم بفرستید
-                # await message.reply("اپلود فایل انجام شد")
-            else:
-                await status_msg.edit_text("❌ خطا در دانلود فایل.")
+            await job()          # اجرای وظیفه (coroutine)
         except Exception as e:
-            print(f"[ERROR] خطا در پردازش فایل: {e}")
-            await status_msg.edit_text(f"❌ خطا: {str(e)[:200]}")
-            # می‌توانید به فرستنده نیز اطلاع دهید
-            # await message.reply(f"❌ متأسفانه خطایی رخ داد:\n`{str(e)}`")
+            print(f"[QUEUE] خطا در پردازش وظیفه: {e}")
         finally:
-            # علامت‌گذاری به‌عنوان انجام‌شده در صف
-            file_queue.task_done()
+            job_queue.task_done()
 
 
 @app.on_message(
@@ -73,22 +40,49 @@ async def process_file_worker():
     | filters.sticker
 )
 async def handle_file(client: Client, message: Message):
-    """دریافت فایل و اضافه کردن آن به صف پردازش."""
-    try:
-        # ارسال پیام اولیه برای وضعیت صف
-        status_msg = await message.reply("🔢 فایل شما در صف پردازش قرار گرفت...")
-        # اضافه کردن به صف (پردازش توسط worker انجام می‌شود)
-        await file_queue.put((message, status_msg))
-    except Exception as e:
-        print(f"[ERROR] خطا در افزودن به صف: {e}")
-        await message.reply(f"❌ خطا در افزودن فایل به صف:\n`{str(e)}`")
+    # پاسخ سریع برای اطلاع به کاربر
+    status_msg = await message.reply("⏳ فایل به صف پردازش اضافه شد...")
+
+    # تعریف وظیفه‌ای که بعداً اجرا می‌شود
+    async def process():
+        try:
+            await status_msg.edit_text("⏳ در حال دریافت فایل...")
+            print(f"[DOWNLOAD] شروع دانلود فایل...")
+            file_path = await message.download(file_name=DOWNLOAD_PATH)
+
+            if not file_path:
+                await status_msg.edit_text("❌ دانلود فایل ناموفق بود.")
+                return
+
+            print(f"[DOWNLOAD] فایل با موفقیت در {file_path} ذخیره شد.")
+            await status_msg.edit_text("✅ فایل دانلود شد. در حال ارسال...")
+
+            # اجرای split_file در یک thread جداگانه (تابع همزمان است)
+            loop = asyncio.get_running_loop()
+            parts_list = await loop.run_in_executor(None, split_file, file_path)
+
+            for part in parts_list:
+                # ارسال هر تکه از فایل (rubika.send_file همزمان است)
+                result = await loop.run_in_executor(None, rubika.send_file, part, "File")
+                if result["success"]:
+                    print(f"[UPLOAD] تکه {part} با موفقیت ارسال شد.")
+                else:
+                    print(f"[UPLOAD] خطا در ارسال {part}: {result.get('error')}")
+
+            await status_msg.edit_text("✅ آپلود کامل شد.")
+        except Exception as e:
+            print(f"[ERROR] خطا در پردازش صف: {e}")
+            await status_msg.edit_text(f"❌ مشکلی پیش آمد:\n`{str(e)}`")
+
+    # افزودن وظیفه به صف
+    await job_queue.put(process)
 
 
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     welcome_text = (
         "👋 سلام! من ربات دانلود و آپلود فایل هستم.\n\n"
-        "📎 هر فایلی برام بفرستی، دانلودش می‌کنم و برای آپلود به سرور ارسال می‌کنم.\n\n"
+        "📎 هر فایلی برام بفرستی، به صف اضافه می‌شه و به ترتیب دانلود و آپلود می‌کنم.\n\n"
         "📂 فرمت‌های پشتیبانی شده:\n"
         "• اسناد (Document)\n"
         "• ویدیو (Video)\n"
@@ -104,14 +98,7 @@ async def start_command(client: Client, message: Message):
 
 @app.on_message()
 async def other_messages(client: Client, message: Message):
-    await message.reply("⚠️ لطفاً یک فایل ارسال کنید تا پردازش کنم.")
-
-
-# راه‌اندازی worker هنگام شروع ربات
-@app.on_start()
-async def start_worker(client):
-    asyncio.create_task(process_file_worker())
-    print("🔄 کارگر صف آماده به کار است.")
+    await message.reply("⚠️ لطفاً یک فایل ارسال کنید تا به صف اضافه کنم.")
 
 
 if __name__ == "__main__":
@@ -119,5 +106,7 @@ if __name__ == "__main__":
         os.makedirs(DOWNLOAD_PATH)
         print(f"📁 پوشه {DOWNLOAD_PATH} ساخته شد.")
 
+    # شروع تسک worker
+    app.loop.create_task(worker())
     print("🤖 ربات در حال اجرا...")
     app.run()
