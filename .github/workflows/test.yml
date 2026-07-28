@@ -1,0 +1,378 @@
+name: 0x00 dl
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Target URLs (Separate with space, comma, or new line)'
+        required: true
+        type: string
+      youtube_method:
+        description: 'YouTube Download Method'
+        required: true
+        type: choice
+        options:
+          - 'Fast API (No Cookies needed - Fastest)'
+          - 'yt-dlp (Reliable - Use this if you have Cookies)'
+      split_method:
+        description: 'How to split files larger than 95MB?'
+        required: true
+        type: choice
+        options:
+          - 'Archive (7z - Creates .001, .002 files - Best for Movies/APKs)'
+          - 'Video Chunks (FFmpeg - Cuts video into 5-min playable MP4 parts)'
+      quality:
+        description: 'Video Quality (for supported extractors)'
+        required: true
+        type: choice
+        options:
+          - '480p (MP4 format - Recommended for <95MB)'
+          - '720p (MP4 format)'
+          - '360p (MP4 format)'
+          - 'Audio (MP3 format)'
+          - 'Best (Highest available)'
+      password:
+        description: 'ZIP Password (Optional - No ZIP applied if empty & under 95MB)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  download-and-save:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/dl/
+            !/apks/
+
+      - name: Fast Setup (Python Only)
+        run: |
+          pip3 install requests --break-system-packages
+
+      - name: Setup YouTube Cookies 
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" > youtube_cookies.txt
+          else
+            touch youtube_cookies.txt
+          fi
+
+      - name: Setup Bunkr script
+        run: |
+          cat << 'EOF' > bunkr.py
+          import os, sys, json, time, base64, requests, re
+          from math import floor
+          from itertools import cycle
+          from urllib.parse import urlparse
+
+          BUNKRR_API = "https://bunkr.cr/api/vs"
+          BUNKRR_DOMAINS = ("bunkr.si", "bunkr.fi", "bunkr.ru", "bunkr.cr", "bunkr.rip", "bunkrr.su")
+          BUNKRR_DOWNLOAD_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://get.bunkrr.su/"}
+          _offline_subs = set()
+          
+          def get_slug(url): 
+              match = re.search(r"/([a-zA-Z0-9_-]+)(?:\?|/|$)", url)
+              return match.group(1) if match else None
+          
+          def fetch_api(url):
+              slug = get_slug(url)
+              if not slug: return None
+              for dom in (BUNKRR_API.split("/")[2], *_offline_subs):
+                  try:
+                      resp = requests.post(f"https://{dom}/api/vs", json={"slug": slug}, headers=BUNKRR_DOWNLOAD_HEADERS, timeout=30)
+                      if resp.status_code == 200: return resp.json()
+                      if resp.status_code == 502: _offline_subs.add(dom)
+                  except: continue
+              return None
+
+          def decrypt(api_resp):
+              try:
+                  t, enc = api_resp["timestamp"], base64.b64decode(api_resp["url"])
+                  dec = bytearray(b ^ next(cycle(f"SECRET_KEY_{floor(t/3600)}".encode("utf-8"))) for b in enc)
+                  return dec.decode("utf-8", errors="ignore")
+              except: return None
+
+          if __name__ == "__main__":
+              url = sys.argv[1]
+              outdir = sys.argv[2]
+              api_resp = fetch_api(url)
+              dl_link = decrypt(api_resp) if api_resp else None
+              if dl_link:
+                  filepath = os.path.join(outdir, urlparse(dl_link).path.rstrip("/").split("/")[-1])
+                  resp = requests.get(dl_link, headers=BUNKRR_DOWNLOAD_HEADERS, stream=True)
+                  with open(filepath, "wb") as f:
+                      for c in resp.iter_content(8192): f.write(c) if c else None
+          EOF
+
+      - name: Setup YouTube API script
+        run: |
+          cat << 'EOF' > yt_api.py
+          import os, sys, time, requests, re
+          
+          url = sys.argv[1]
+          quality_input = sys.argv[2]
+          outdir = sys.argv[3]
+          
+          API = 'https://hub.ytconvert.org/api/download'
+          HEADERS = {
+              'User-Agent': 'Mozilla/5.0',
+              'Accept': 'application/json',
+              'Referer': 'https://media.ytmp3.gg/',
+              'Origin': 'https://media.ytmp3.gg'
+          }
+          
+          if "Audio" in quality_input:
+              payload = {'url': url, 'os': 'linux', 'output': {'type': 'audio', 'format': 'mp3'}, 'audio': {'bitrate': '320k'}}
+              ext = 'mp3'
+          else:
+              q = '720p'
+              if '1080' in quality_input: q = '1080p'
+              elif '480' in quality_input: q = '480p'
+              elif '360' in quality_input: q = '360p'
+              payload = {'url': url, 'os': 'linux', 'output': {'type': 'video', 'format': 'mp4', 'quality': q}}
+              ext = 'mp4'
+          
+          try:
+              resp = requests.post(API, json=payload, headers=HEADERS, timeout=15)
+              if resp.status_code != 200: sys.exit(1)
+              
+              status_url = resp.json().get('statusUrl')
+              if not status_url: sys.exit(1)
+              
+              for _ in range(60):
+                  time.sleep(2)
+                  s_resp = requests.get(status_url, headers=HEADERS, timeout=10)
+                  if s_resp.status_code == 200:
+                      data = s_resp.json()
+                      if data.get('status') == 'completed':
+                          dl_url = data.get('downloadUrl')
+                          raw_title = data.get('title', 'YouTube_Video')
+                          title = re.sub(r'[\\/*?:"<>| ]', '_', raw_title)
+                          
+                          if dl_url:
+                              filepath = os.path.join(outdir, f"{title}.{ext}")
+                              dl_req = requests.get(dl_url, stream=True, timeout=60)
+                              with open(filepath, "wb") as f:
+                                  for chunk in dl_req.iter_content(8192):
+                                      if chunk: f.write(chunk)
+                              sys.exit(0)
+                      elif data.get('status') in ('failed', 'error'):
+                          sys.exit(1)
+              sys.exit(1)
+          except Exception as e:
+              sys.exit(1)
+          EOF
+
+      - name: Download & Process Files
+        shell: bash
+        run: |
+          RAW_URLS="${{ github.event.inputs.url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          YT_METHOD="${{ github.event.inputs.youtube_method }}"
+          
+          FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
+          
+          rm -rf tmp_downloads
+          mkdir -p tmp_downloads dl
+          
+          if [[ "$QUALITY" == *"720p"* ]]; then
+            YTDLP_F="-f bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best --merge-output-format mp4"
+          elif [[ "$QUALITY" == *"480p"* ]]; then
+            YTDLP_F="-f bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]/best[ext=mp4][height<=480]/best --merge-output-format mp4"
+          elif [[ "$QUALITY" == *"360p"* ]]; then
+            YTDLP_F="-f bestvideo[ext=mp4][height<=360]+bestaudio[ext=m4a]/best[ext=mp4][height<=360]/best --merge-output-format mp4"
+          elif [[ "$QUALITY" == *"Audio"* ]]; then
+            YTDLP_F="-x --audio-format mp3"
+          else
+            YTDLP_F="--merge-output-format mp4"
+          fi
+
+          install_heavy_tools() {
+            if [ ! -f "/usr/local/bin/yt-dlp" ]; then
+              echo "⏳ Installing heavy tools (yt-dlp, aria2, ffmpeg, bun)..."
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends aria2 ffmpeg > /dev/null 2>&1
+              sudo curl -sL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+              sudo chmod a+rx /usr/local/bin/yt-dlp
+              curl -fsSL https://bun.com/install | bash > /dev/null 2>&1
+              export PATH="$HOME/.bun/bin:$PATH"
+            fi
+          }
+
+          for URL in $FORMATTED_URLS; do
+            if [ -z "$URL" ]; then continue; fi
+            echo "Processing URL: $URL"
+
+            if echo "$URL" | grep -qE "(bunkr\.si|bunkr\.fi|bunkr\.ru|bunkr\.cr|bunkr\.rip|bunkrr\.su)"; then
+              python3 bunkr.py "$URL" "tmp_downloads"
+              
+            elif echo "$URL" | grep -qE "(youtube\.com|youtu\.be)"; then
+              if [[ "$YT_METHOD" == *"Fast API"* ]]; then
+                if python3 yt_api.py "$URL" "$QUALITY" "tmp_downloads"; then
+                  echo "Downloaded via Fast API"
+                else
+                  echo "API Failed. Falling back to yt-dlp..."
+                  install_heavy_tools
+                  COOKIE_ARG=""
+                  [ -s youtube_cookies.txt ] && COOKIE_ARG="--cookies youtube_cookies.txt"
+                  yt-dlp --restrict-filenames --js-runtimes bun:$HOME/.bun/bin/bun $COOKIE_ARG $YTDLP_F -o "tmp_downloads/%(title)s.%(ext)s" "$URL"
+                fi
+              else
+                install_heavy_tools
+                COOKIE_ARG=""
+                [ -s youtube_cookies.txt ] && COOKIE_ARG="--cookies youtube_cookies.txt"
+                yt-dlp --restrict-filenames --js-runtimes bun:$HOME/.bun/bin/bun $COOKIE_ARG $YTDLP_F -o "tmp_downloads/%(title)s.%(ext)s" "$URL"
+              fi
+            
+            elif echo "$URL" | grep -qE "(twitch\.tv|reddit\.com|vimeo|soundcloud)"; then
+              install_heavy_tools
+              COOKIE_ARG=""
+              [ -s youtube_cookies.txt ] && COOKIE_ARG="--cookies youtube_cookies.txt"
+              yt-dlp --restrict-filenames --js-runtimes bun:$HOME/.bun/bin/bun $COOKIE_ARG $YTDLP_F -o "tmp_downloads/%(title)s.%(ext)s" "$URL"
+              
+            else
+              install_heavy_tools
+              aria2c --content-disposition-default-utf8=true --split=2 --max-connection-per-server=2 --dir="tmp_downloads" "$URL"
+            fi
+          done
+
+      - name: Split & Zip
+        shell: bash
+        run: |
+          HAS_PASS="${{ github.event.inputs.password }}"
+          SPLIT_METHOD="${{ github.event.inputs.split_method }}"
+          
+          rm -f dl/*.part.* dl/*.7z.* dl/*.zip 2>/dev/null || true
+          touch new_files.txt
+          
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            LIMIT=$((95 * 1024 * 1024))
+            BASENAME=$(basename "$FILE")
+            NAME_WITHOUT_EXT="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            
+            # Condition 1: File is larger than 95MB
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              
+              # If user chose Video Chunking AND file is a video
+              if [[ "$SPLIT_METHOD" == *"Video Chunks"* ]] && [[ "$EXT" =~ ^(mp4|mkv|avi|webm)$ ]]; then
+                echo "Splitting large video into chunks: $BASENAME"
+                if ! command -v ffmpeg &> /dev/null; then
+                  sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg > /dev/null 2>&1
+                fi
+                
+                # Using fast & robust segment muxer
+                ffmpeg -i "$FILE" -c copy -f segment -segment_time 300 -reset_timestamps 1 "dl/${NAME_WITHOUT_EXT}_part_%03d.${EXT}" -y 2>/dev/null
+                
+                for PART in "dl/${NAME_WITHOUT_EXT}_part_"*; do
+                  [ -f "$PART" ] && basename "$PART" >> new_files.txt
+                done
+              
+              # Otherwise (Archive method OR file is not a video)
+              else
+                echo "Splitting large file via 7z Archive: $BASENAME"
+                if ! command -v 7z &> /dev/null; then
+                  sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends p7zip-full > /dev/null 2>&1
+                fi
+                
+                if [ -n "$HAS_PASS" ]; then
+                  7z a -v95m -p"$HAS_PASS" -mhe=on "dl/${NAME_WITHOUT_EXT}.7z" "$FILE" -y > /dev/null
+                else
+                  7z a -v95m "dl/${NAME_WITHOUT_EXT}.7z" "$FILE" -y > /dev/null
+                fi
+                
+                for ZPART in "dl/${NAME_WITHOUT_EXT}".7z.00*; do
+                  [ -f "$ZPART" ] && basename "$ZPART" >> new_files.txt
+                done
+              fi
+              
+            # Condition 2: Small file but needs password
+            elif [ -n "$HAS_PASS" ]; then
+              echo "Encrypting small file: $BASENAME"
+              if ! command -v 7z &> /dev/null; then
+                sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends p7zip-full > /dev/null 2>&1
+              fi
+              7z a -p"$HAS_PASS" -mhe=on "dl/${NAME_WITHOUT_EXT}.7z" "$FILE" -y > /dev/null
+              echo "${NAME_WITHOUT_EXT}.7z" >> new_files.txt
+              
+            # Condition 3: Small file, no password
+            else
+              echo "Copying raw file: $BASENAME"
+              cp -f "$FILE" "dl/$BASENAME"
+              echo "$BASENAME" >> new_files.txt
+            fi
+          done
+          rm -rf tmp_downloads
+
+      - name: Update Links.md
+        shell: bash
+        run: |
+          [ ! -s new_files.txt ] && exit 0
+          
+          REPO="${{ github.repository }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          
+          HEADER="## 🔗 Direct Download Links\n> Click on any link below to start downloading directly.<br><br/>\n\n"
+          echo "### 📅 $(TZ='Asia/Tehran' date +'%Y-%m-%d %H:%M') IR" > current_run.md
+          
+          while IFS= read -r FNAME; do
+            [ -z "$FNAME" ] && continue
+            ENCODED_NAME=$(python3 -c "import urllib.parse; print(urllib.parse.quote(input()))" <<< "$FNAME")
+            RAW_URL="https://github.com/$REPO/raw/$BRANCH/dl/$ENCODED_NAME"
+            
+            DISPLAY_NAME=$(echo "$FNAME" | sed -E 's/android[0-9]+\+_//g; s/-release//g')
+            
+            export FNAME_ENV="$FNAME"
+            SIZE_STR=$(python3 -c "import os; fname = os.environ.get('FNAME_ENV'); path = f'dl/{fname}'; size = os.path.getsize(path) if os.path.exists(path) else 0; print(f'{size/1048576:.1f}MB' if size >= 1048576 else f'{size//1024}KB')")
+            
+            if [[ "$FNAME" == *"_part_"* ]]; then
+              ICON="🎬 (Part)"
+            else
+              EXT="${FNAME##*.}"
+              case "$EXT" in
+                apk)             ICON="📱" ;;
+                mp4|mkv|avi|mov) ICON="🎬" ;;
+                mp3|m4a|flac|ogg) ICON="🎵" ;;
+                00[1-9]*|7z)     ICON="🗜️" ;;
+                *)               ICON="📥" ;;
+              esac
+            fi
+            
+            echo "- $ICON [$DISPLAY_NAME]($RAW_URL) \`$SIZE_STR\`" >> current_run.md
+            echo "" >> current_run.md
+          done < new_files.txt
+          
+          echo "---" >> current_run.md
+          echo "" >> current_run.md
+          
+          if [ -f Links.md ]; then
+            tail -n +4 Links.md > old_links.md 2>/dev/null || touch old_links.md
+            echo -e "$HEADER" > Links.md
+            cat current_run.md old_links.md >> Links.md
+            rm old_links.md
+          else
+            echo -e "$HEADER" > Links.md
+            cat current_run.md >> Links.md
+          fi
+          rm -f new_files.txt current_run.md
+
+      - name: Push to Repository
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "NET-Sentinel Bot"
+          git config user.email "224584266+NetSentinel-Bot@users.noreply.github.com"
+          git add --sparse dl/ Links.md
+          git -c committer.name="Diana-Cl" -c committer.email="135276904+Diana-Cl@users.noreply.github.com" commit -m "Add downloaded files via Panel [skip ci] at: $(TZ='Asia/Tehran' date '+%H:%M:%S') [skip ci]" || echo "No changes to commit"
+          git push origin HEAD:$BRANCH
